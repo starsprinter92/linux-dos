@@ -1,0 +1,1108 @@
+#!/usr/bin/env python3
+
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    import readline
+except ImportError:
+    readline = None
+
+
+ALIASES = {}
+ECHO_ENABLED = True
+PROMPT_VISIBLE = True
+PROMPT_FORMAT = "$P$G"
+
+SHELL_BUILTINS = {
+    "echo", "printf", "pwd", "true", "false", "test", "type",
+    "command", "set", "unset", "export", "read", "ulimit",
+    "umask", "shift", "getopts", "return", "break", "continue",
+    "eval", "exec", "source", "jobs", "fg", "bg",
+}
+
+DOS_BUILTINS = {
+    "exit", "cd", "dir", "alias", "history", "cls", "help", "ver",
+    "echo", "prompt"
+}
+
+TOKEN_RE = re.compile(
+    r'''^\s*(?:"([^"]+)"|'([^']+)'|([^\s|&;<>()[\]]+))'''
+)
+
+# C: represents the Linux root filesystem.
+# D:, E:, etc. are dynamically assigned to USB filesystems.
+DRIVE_ROOTS = {"C": "/"}
+DRIVE_DEVICES = {}
+
+
+def strip_quotes(value):
+    value = value.strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        return value[1:-1]
+
+    return value
+
+
+def command_token(command):
+    match = TOKEN_RE.match(command)
+
+    if not match:
+        return None, None
+
+    token = next(
+        (group for group in match.groups() if group is not None),
+        None,
+    )
+
+    return token, match
+
+
+def replace_command(command, match, replacement):
+    return shlex.quote(replacement) + command[match.end():]
+
+
+def make_83_names(names):
+    """Generate deterministic DOS-style 8.3 names."""
+    used = set()
+    result = {}
+
+    invalid = re.compile(r"[^A-Z0-9$%_'@~`!(){}^#&-]")
+
+    for filename in sorted(names, key=str.casefold):
+        base, ext = os.path.splitext(filename)
+
+        if ext:
+            ext = ext[1:]
+        else:
+            base = filename
+
+        clean_base = invalid.sub("", base.upper()) or "FILE"
+        clean_ext = invalid.sub("", ext.upper())[:3]
+
+        simple = (
+            len(clean_base) <= 8
+            and clean_base == base.upper()
+            and clean_ext == ext.upper()
+            and len(ext) <= 3
+        )
+
+        candidate = clean_base[:8]
+        key = (candidate, clean_ext)
+
+        if not simple or key in used:
+            number = 1
+
+            while True:
+                suffix = f"~{number}"
+                candidate = clean_base[:8 - len(suffix)] + suffix
+                key = (candidate, clean_ext)
+
+                if key not in used:
+                    break
+
+                number += 1
+
+        used.add(key)
+        result[filename] = key
+
+    return result
+
+
+def resolve_case_insensitive(path):
+    """Resolve case-insensitive Linux paths and DOS 8.3 aliases."""
+    path = os.path.expanduser(path)
+
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+
+    path = os.path.normpath(path)
+    current = os.path.sep
+    parts = [part for part in path.split(os.path.sep) if part]
+
+    for index, part in enumerate(parts):
+        if part == "..":
+            current = os.path.dirname(current.rstrip(os.sep)) or os.sep
+            continue
+
+        if part == ".":
+            continue
+
+        try:
+            entries = os.listdir(current)
+        except OSError:
+            entries = []
+
+        actual = next(
+            (
+                entry for entry in entries
+                if entry.casefold() == part.casefold()
+            ),
+            None,
+        )
+
+        # Resolve short names such as YOYING~1.
+        if actual is None:
+            visible = [
+                entry for entry in entries
+                if not entry.startswith(".")
+            ]
+
+            for entry, (short_base, short_ext) in make_83_names(
+                visible
+            ).items():
+                alias = short_base
+
+                if short_ext:
+                    alias += "." + short_ext
+
+                if alias.casefold() == part.casefold():
+                    actual = entry
+                    break
+
+        if actual is None:
+            current = os.path.join(current, *parts[index:])
+            break
+
+        current = os.path.join(current, actual)
+
+    return os.path.normpath(current)
+
+
+def scan_usb_volumes():
+    """Find USB/removable filesystems and their mountpoints."""
+    try:
+        result = subprocess.run(
+            [
+                "lsblk", "-J", "-p", "-o",
+                "PATH,TYPE,RM,TRAN,FSTYPE,MOUNTPOINTS",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        tree = json.loads(result.stdout).get("blockdevices", [])
+
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+    ):
+        return []
+
+    found = {}
+
+    def visit(nodes, usb_parent=False):
+        for node in nodes:
+            removable = str(
+                node.get("rm", "")
+            ).casefold() in ("1", "true")
+
+            transport = str(node.get("tran") or "").casefold()
+            is_usb = usb_parent or removable or transport == "usb"
+
+            children = node.get("children") or []
+            mounts = node.get("mountpoints") or []
+
+            if isinstance(mounts, str):
+                mounts = [mounts]
+
+            mounts = [mount for mount in mounts if mount]
+
+            filesystem = node.get("fstype")
+            kind = node.get("type")
+            device = node.get("path")
+
+            valid_kind = (
+                kind in ("part", "crypt", "lvm")
+                or (kind == "disk" and not children)
+            )
+
+            if (
+                is_usb
+                and device
+                and filesystem
+                and valid_kind
+            ):
+                mountpoint = next(
+                    (
+                        mount for mount in mounts
+                        if os.path.isdir(mount)
+                    ),
+                    None,
+                )
+
+                found[device] = mountpoint
+
+            visit(children, is_usb)
+
+    visit(tree)
+
+    return sorted(
+        found.items(),
+        key=lambda item: item[0].casefold(),
+    )
+
+
+def refresh_drives():
+    """Assign C: to / and subsequent letters to discovered USB volumes."""
+    global DRIVE_ROOTS, DRIVE_DEVICES
+
+    roots = {"C": "/"}
+    devices = {}
+
+    for index, (device, mountpoint) in enumerate(
+        scan_usb_volumes()
+    ):
+        letter = chr(ord("D") + index)
+
+        if letter > "Z":
+            break
+
+        devices[letter] = device
+
+        if mountpoint:
+            roots[letter] = mountpoint
+
+    DRIVE_ROOTS = roots
+    DRIVE_DEVICES = devices
+
+    return roots
+
+
+def drive_root(letter):
+    """Return a drive's root, mounting its USB filesystem if necessary."""
+    letter = letter.upper()
+    refresh_drives()
+
+    if letter == "C":
+        return "/"
+
+    root = DRIVE_ROOTS.get(letter)
+
+    if root:
+        return root
+
+    device = DRIVE_DEVICES.get(letter)
+
+    if not device:
+        return None
+
+    if not shutil.which("udisksctl"):
+        print("Cannot mount drive: udisksctl is not installed.")
+        return None
+
+    result = subprocess.run(
+        ["udisksctl", "mount", "-b", device],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        message = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "unknown error"
+        )
+
+        print(f"Mount failed for {letter}: {message}")
+        return None
+
+    refresh_drives()
+
+    return DRIVE_ROOTS.get(letter)
+
+
+def drive_for_path(path):
+    """Determine which DOS drive contains a filesystem path."""
+    roots = refresh_drives()
+    path = os.path.realpath(os.path.abspath(path))
+    matches = []
+
+    for letter, root in roots.items():
+        root = os.path.realpath(os.path.abspath(root))
+
+        try:
+            if os.path.commonpath((path, root)) == root:
+                matches.append((len(root), letter))
+        except ValueError:
+            pass
+
+    return max(matches)[1] if matches else "C"
+
+
+def linux_path_to_dos(path):
+    path = os.path.normpath(os.path.abspath(path))
+    home_root = os.path.normpath("/home")
+
+    if path == home_root:
+        path = r"\Users"
+    elif path.startswith(home_root + os.sep):
+        path = r"\Users" + path[len(home_root):]
+
+    return path.replace("/", "\\")
+
+
+def path_for_drive(path, letter):
+    path = os.path.abspath(path)
+    roots = refresh_drives()
+
+    if letter == "C":
+        return linux_path_to_dos(path)
+
+    root = roots.get(letter)
+
+    if not root:
+        return "\\"
+
+    try:
+        relative = os.path.relpath(path, root)
+    except ValueError:
+        return linux_path_to_dos(path)
+
+    if relative == ".":
+        return "\\"
+
+    if relative == ".." or relative.startswith(".." + os.sep):
+        return linux_path_to_dos(path)
+
+    return "\\" + relative.replace(os.sep, "\\")
+
+
+def get_dos_prompt():
+    """Render the current DOS prompt using DOS PROMPT special codes."""
+    letter = drive_for_path(os.getcwd())
+    path = f"{letter}:{path_for_drive(os.getcwd(), letter)}"
+    now = datetime.datetime.now()
+    replacements = {
+        "P": path,
+        "G": ">",
+        "L": "<",
+        "B": "|",
+        "Q": "=",
+        "H": "\b",
+        "E": "\x1b",
+        "N": letter,
+        "D": now.strftime("%a %m-%d-%Y"),
+        "T": now.strftime("%H:%M:%S.%f")[:-4],
+        "V": "MS-DOS Version 3.30 (Linux DOS-style shell)",
+        "$": "$",
+        "_": "\n",
+    }
+    output = []
+    index = 0
+    while index < len(PROMPT_FORMAT):
+        char = PROMPT_FORMAT[index]
+        if char == "$" and index + 1 < len(PROMPT_FORMAT):
+            code = PROMPT_FORMAT[index + 1].upper()
+            if code in replacements:
+                output.append(replacements[code])
+                index += 2
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def get_linux_path(dos_path):
+    """Translate DOS paths into Linux paths."""
+    raw = strip_quotes(dos_path)
+
+    if not raw:
+        return os.getcwd()
+
+    raw = os.path.expanduser(raw)
+    match = re.match(r"^([a-zA-Z]):(.*)$", raw)
+
+    if match:
+        letter = match.group(1).upper()
+        root = drive_root(letter)
+
+        if root is None:
+            return os.path.join("/", "__invalid_dos_drive__", letter)
+
+        tail = match.group(2).replace("\\", "/")
+
+        if not tail:
+            return root
+
+        if tail.startswith("/"):
+            parts = [part for part in tail.split("/") if part]
+
+            if (
+                letter == "C"
+                and parts
+                and parts[0].casefold() == "users"
+            ):
+                path = os.path.join("/home", *parts[1:])
+            else:
+                path = os.path.join(root, *parts)
+
+        else:
+            current_letter = drive_for_path(os.getcwd())
+
+            base = (
+                os.getcwd()
+                if current_letter == letter
+                else root
+            )
+
+            path = os.path.join(base, tail)
+
+    else:
+        raw = raw.replace("\\", "/")
+
+        if raw in ("", "."):
+            path = os.getcwd()
+
+        elif raw.startswith("/"):
+            parts = [part for part in raw.split("/") if part]
+
+            if parts and parts[0].casefold() == "users":
+                path = os.path.join("/home", *parts[1:])
+            else:
+                path = raw
+
+        else:
+            path = os.path.join(os.getcwd(), raw)
+
+    return resolve_case_insensitive(path)
+
+
+def run_dir(command):
+    _, separator, argument = command.partition(" ")
+
+    target = (
+        get_linux_path(argument)
+        if separator and argument.strip()
+        else os.getcwd()
+    )
+
+    if not os.path.isdir(target):
+        print("Invalid directory\n")
+        return
+
+    letter = drive_for_path(target)
+
+    print(f"\n Volume in drive {letter} has no label")
+    print(
+        f" Directory of "
+        f"{letter}:{path_for_drive(target, letter)}\n"
+    )
+
+    files = 0
+    directories = 0
+    total_bytes = 0
+
+    try:
+        names = sorted(
+            (
+                name for name in os.listdir(target)
+                if not name.startswith(".")
+            ),
+            key=str.casefold,
+        )
+
+        short_names = make_83_names(names)
+
+        for name in names:
+            full_path = os.path.join(target, name)
+
+            try:
+                info = os.stat(full_path)
+            except OSError:
+                continue
+
+            # datetime is imported as a module, so use datetime.datetime.
+            modified = datetime.datetime.fromtimestamp(info.st_mtime)
+
+            timestamp = modified.strftime(
+                "%m-%d-%y  %I:%M%p"
+            ).upper()
+
+            short_base, short_ext = short_names[name]
+
+            if os.path.isdir(full_path):
+                print(
+                    f" {short_base:<8} {short_ext:<3} "
+                    f"{'<DIR>':>10} {timestamp}"
+                )
+
+                directories += 1
+
+            else:
+                print(
+                    f" {short_base:<8} {short_ext:<3} "
+                    f"{info.st_size:>10,} {timestamp}"
+                )
+
+                files += 1
+                total_bytes += info.st_size
+
+        _, _, free_bytes = shutil.disk_usage(target)
+
+        print(
+            f"\n{files:>7} File(s) "
+            f"{total_bytes:>14,} bytes"
+        )
+
+        print(
+            f"{directories:>7} Dir(s) "
+            f"{free_bytes:>14,} bytes free\n"
+        )
+
+    except OSError as error:
+        print(f"Unable to read directory: {error}\n")
+
+
+def run_alias(command):
+    _, separator, argument = command.partition(" ")
+
+    if not separator or not argument.strip():
+        if ALIASES:
+            for name, target in sorted(ALIASES.items()):
+                print(f"{name.upper()}={target}")
+        else:
+            print("No aliases defined.")
+
+        print()
+        return
+
+    pair = argument.split("=", 1)
+
+    if len(pair) != 2 or not pair[0].strip():
+        print("Invalid syntax. Use: ALIAS name=command\n")
+        return
+
+    name = pair[0].strip().casefold()
+    target = pair[1].strip()
+
+    if target:
+        ALIASES[name] = target
+    else:
+        ALIASES.pop(name, None)
+
+
+def run_history():
+    if readline is None:
+        print("History engine unavailable.\n")
+        return
+
+    length = readline.get_current_history_length()
+
+    if not length:
+        print("History empty.\n")
+        return
+
+    for index in range(1, length + 1):
+        item = readline.get_history_item(index)
+
+        if item:
+            print(f" {index:>4}  {item}")
+
+    print()
+
+
+def command_exists(command):
+    try:
+        return subprocess.run(
+            [
+                "/bin/bash", "-c",
+                'command -v "$1" >/dev/null 2>&1',
+                "dos-shell", command,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+
+    except OSError:
+        return False
+
+
+def find_executable(name):
+    """Find executables by name, including local and case-insensitive matches."""
+    has_path = "/" in name or "\\" in name
+
+    if has_path:
+        candidate = name.replace("\\", os.sep)
+
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(os.getcwd(), candidate)
+
+        candidate = resolve_case_insensitive(candidate)
+
+        if (
+            os.path.isfile(candidate)
+            and os.access(candidate, os.X_OK)
+        ):
+            return candidate
+
+        return None
+
+    try:
+        entries = os.listdir(os.getcwd())
+    except OSError:
+        entries = []
+
+    local = next(
+        (
+            entry for entry in entries
+            if entry.casefold() == name.casefold()
+        ),
+        None,
+    )
+
+    if local:
+        candidate = os.path.join(os.getcwd(), local)
+
+        if (
+            os.path.isfile(candidate)
+            and os.access(candidate, os.X_OK)
+        ):
+            return candidate
+
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        directory = directory or os.getcwd()
+
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+
+        match = next(
+            (
+                entry for entry in entries
+                if entry.casefold() == name.casefold()
+            ),
+            None,
+        )
+
+        if match:
+            candidate = os.path.join(directory, match)
+
+            if (
+                os.path.isfile(candidate)
+                and os.access(candidate, os.X_OK)
+            ):
+                return candidate
+
+    return None
+
+
+def show_help():
+    print("""Built-in commands:
+  CD [directory]       Change or display directory
+  DIR [directory]      List files in DOS format
+  C:, D:, E:...        Switch drives
+  CLS                  Clear screen
+  ECHO [ON|OFF|text]   Control command echoing or print text
+  PROMPT [text]        Set the prompt (e.g. PROMPT $P$G)
+  ALIAS [name=command] Define, remove, or list aliases
+  HISTORY              Show session history
+  VER                  Show shell version
+  HELP                 Show this help
+  EXIT                 Exit DOS
+
+External commands run on the real Linux system; this is not a sandbox.
+""")
+
+
+def process_command(user_input, silent_errors=False):
+    global ECHO_ENABLED, PROMPT_VISIBLE
+    command = user_input.strip()
+
+    # Interactive @ECHO OFF/ON controls prompt visibility independently of
+    # ordinary ECHO state. In AUTOEXEC.BAT, @ only hides that batch line.
+    interactive_at = command.startswith("@") and not silent_errors
+    if command.startswith("@"):
+        command = command[1:].lstrip()
+        if interactive_at and re.fullmatch(r"(?i)echo\s+off", command):
+            PROMPT_VISIBLE = False
+        elif interactive_at and re.fullmatch(r"(?i)echo\s+on", command):
+            PROMPT_VISIBLE = True
+
+    if not command:
+        return
+
+    # Expand aliases with a limit to prevent recursive definitions.
+    for _ in range(10):
+        name, match = command_token(command)
+
+        if not name:
+            break
+
+        target = ALIASES.get(name.casefold())
+
+        if target is None:
+            break
+
+        remainder = command[match.end():].lstrip()
+        command = target + (f" {remainder}" if remainder else "")
+
+    # A bare drive letter switches to that drive's root.
+    switch = re.fullmatch(r"([a-zA-Z]):", command)
+
+    if switch:
+        letter = switch.group(1).upper()
+        root = drive_root(letter)
+
+        if root is None:
+            print(f"Drive {letter}: is unavailable.\n")
+            return
+
+        try:
+            os.chdir(root)
+        except OSError as error:
+            print(f"Unable to enter drive: {error}\n")
+
+        return
+
+    # DOS accepts ECHO. (or ECHO followed by a period) as a blank-line
+    # command. Handle it before tokenization, where "echo." would otherwise
+    # be interpreted as a different command name.
+    echo_dot = re.match(r"(?is)^echo\.(.*)$", command)
+    if echo_dot:
+        print(echo_dot.group(1))
+        return
+
+    # ECHO( is a common batch-file idiom for printing text without the
+    # special parsing edge cases associated with ECHO.
+    echo_paren = re.match(r"(?is)^echo\((.*)$", command)
+    if echo_paren:
+        print(echo_paren.group(1))
+        return
+
+    name, match = command_token(command)
+
+    if not name:
+        return
+
+    builtin = name.casefold()
+
+    if builtin == "exit":
+        raise SystemExit(0)
+
+    if builtin == "echo":
+        argument = command[match.end():].strip()
+        setting = argument.casefold()
+        if setting == "on":
+            ECHO_ENABLED = True
+        elif setting == "off":
+            ECHO_ENABLED = False
+        elif not argument:
+            # DOS ECHO with no arguments reports the current echo state.
+            print("ECHO is " + ("ON" if ECHO_ENABLED else "OFF"))
+        else:
+            # Print the text literally; do not interpret it as shell syntax.
+            print(argument)
+        return
+
+    if builtin == "prompt":
+        global PROMPT_FORMAT
+        argument = command[match.end():].strip()
+        if argument:
+            PROMPT_FORMAT = argument
+        else:
+            print(f"PROMPT {PROMPT_FORMAT}")
+        return
+
+    if builtin == "cd":
+        argument = command[match.end():].strip()
+
+        if not argument:
+            print(get_dos_prompt())
+            return
+
+        if argument.casefold().startswith("/d "):
+            argument = argument[3:].strip()
+
+        drive_match = re.fullmatch(
+            r"([a-zA-Z]):",
+            strip_quotes(argument),
+        )
+
+        if drive_match:
+            return process_command(
+                drive_match.group(0),
+                silent_errors,
+            )
+
+        target = get_linux_path(argument)
+
+        try:
+            if not os.path.isdir(target):
+                print("Invalid directory\n")
+                return
+
+            os.chdir(target)
+
+        except OSError as error:
+            print(f"Unable to change directory: {error}\n")
+
+        return
+
+    if builtin == "dir":
+        run_dir(command)
+        return
+
+    if builtin == "alias":
+        run_alias(command)
+        return
+
+    if builtin == "history":
+        run_history()
+        return
+
+    if builtin == "cls":
+        print("\033[H\033[J", end="", flush=True)
+        return
+
+    if builtin == "help":
+        show_help()
+        return
+
+    if builtin == "ver":
+        print("MS-DOS Version 3.30 (Linux DOS-style shell)\n")
+        return
+
+    executable = find_executable(name)
+
+    if executable:
+        command = replace_command(command, match, executable)
+
+    elif not command_exists(name):
+        if not silent_errors:
+            print("Bad command or file name\n")
+        return
+
+    try:
+        subprocess.run(
+            command,
+            shell=True,
+            executable="/bin/bash",
+            preexec_fn=lambda: signal.signal(
+                signal.SIGINT,
+                signal.SIG_DFL,
+            ),
+            check=False,
+        )
+
+    except KeyboardInterrupt:
+        print("^C\n")
+
+    except OSError as error:
+        if not silent_errors:
+            print(f"Unable to run command: {error}\n")
+
+
+def load_autoexec():
+    path = os.path.join(
+        os.path.expanduser("~"),
+        "AUTOEXEC.BAT",
+    )
+
+    if not os.path.isfile(path):
+        return
+
+    try:
+        with open(
+            path,
+            encoding="utf-8",
+            errors="replace",
+        ) as autoexec:
+
+            for line in autoexec:
+                line = line.strip()
+
+                if (
+                    not line
+                    or line.startswith("#")
+                    or line.startswith("::")
+                    or line.upper() == "REM"
+                    or line.upper().startswith("REM ")
+                    or line.upper().startswith("REM\t")
+                ):
+                    continue
+
+                # DOS batch files support @command to hide that one line.
+                hide_line = line.startswith("@")
+                if hide_line:
+                    line = line[1:].lstrip()
+                    if not line:
+                        continue
+
+                if ECHO_ENABLED and not hide_line:
+                    # DOS batch echo includes the active prompt before each command.
+                    print(f"{get_dos_prompt()} {line}")
+
+                process_command(line, silent_errors=True)
+
+    except OSError as error:
+        print(f"Error loading AUTOEXEC.BAT: {error}\n")
+
+
+def setup_readline():
+    if readline is None:
+        return
+
+    try:
+        readline.set_completer_delims(" \t\n`@$><=;|&(")
+
+        def complete(text, state):
+            line = readline.get_line_buffer()
+            before = line[:readline.get_begidx()]
+
+            if not before.strip():
+                candidates = (
+                    set(DOS_BUILTINS)
+                    | set(ALIASES)
+                    | SHELL_BUILTINS
+                )
+
+                for directory in os.environ.get(
+                    "PATH", ""
+                ).split(os.pathsep):
+
+                    try:
+                        candidates.update(
+                            os.listdir(directory or os.getcwd())
+                        )
+                    except OSError:
+                        pass
+
+                choices = sorted(
+                    (
+                        item for item in candidates
+                        if item.casefold().startswith(text.casefold())
+                    ),
+                    key=str.casefold,
+                )
+
+            else:
+                raw = strip_quotes(text)
+                normalized = raw.replace("\\", "/")
+
+                if "/" in normalized:
+                    directory_part, fragment = normalized.rsplit("/", 1)
+
+                    directory = get_linux_path(
+                        directory_part or "/"
+                    )
+
+                    # Preserve the typed directory portion (e.g. "~/" or
+                    # "C:\\Users\\") when replacing the current token.
+                    separator_index = max(text.rfind("/"), text.rfind("\\"))
+                    prefix = text[:separator_index + 1]
+
+                else:
+                    directory = os.getcwd()
+                    fragment = raw
+                    prefix = ""
+
+                try:
+                    entries = os.listdir(directory)
+                except OSError:
+                    entries = []
+
+                choices = []
+
+                for entry in entries:
+                    if entry.casefold().startswith(fragment.casefold()):
+                        candidate = prefix + entry
+
+                        if (
+                            " " in candidate
+                            and not text.startswith(('"', "'"))
+                        ):
+                            candidate = '"' + candidate + '"'
+
+                        choices.append(candidate)
+
+                choices.sort(key=str.casefold)
+
+            return choices[state] if state < len(choices) else None
+
+        readline.set_completer(complete)
+        readline.parse_and_bind("tab: complete")
+
+    except Exception:
+        pass
+
+
+def main():
+    is_linux_tty = (
+        sys.stdin.isatty()
+        and os.environ.get("TERM") == "linux"
+    )
+
+    if is_linux_tty:
+        print("Starting MS-DOS...", end="", flush=True)
+        time.sleep(0.5)
+
+        print(
+            "\n\nHIMEM is testing extended memory...",
+            end="",
+            flush=True,
+        )
+
+        time.sleep(1.5)
+        print("done. (16384 KB OK)\n")
+
+    else:
+        print("""      ╔═══════════════════════════════════════════════════════════════════════╗
+      ║   Type EXIT and press ENTER to quit this MS-DOS prompt and            ║
+      ║     return to Windows.                                                ║
+      ║   Press ALT+TAB to switch to Windows another application.             ║
+      ║   Press ALT+ENTER to switch this MS-DOS Prompt between a window and   ║
+      ║     full screen.                                                      ║
+      ╚═══════════════════════════════════════════════════════════════════════╝
+
+Microsoft(R) MS-DOS(R)  Version 3.30
+(C)Copyright Microsoft Corp 1981-1987
+""")
+
+    setup_readline()
+    refresh_drives()
+    load_autoexec()
+
+    # ECHO OFF in AUTOEXEC.BAT controls batch command display only. It must
+    # never leave the interactive prompt hidden after startup. Only typing
+    # @ECHO OFF at the live prompt changes PROMPT_VISIBLE.
+    global PROMPT_VISIBLE
+    PROMPT_VISIBLE = True
+
+    while True:
+        try:
+            # @ECHO OFF/ON controls interactive prompt visibility.
+            prompt = f"{get_dos_prompt()} " if PROMPT_VISIBLE else ""
+            process_command(input(prompt))
+
+        except KeyboardInterrupt:
+            print("^C\n")
+
+        except EOFError:
+            print()
+            return
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
