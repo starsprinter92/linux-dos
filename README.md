@@ -3,7 +3,7 @@
 a DOS-inspired command-line shell for Linux. fully vibecoded. use at your own risk.
 
 ## requirements
-basically just bash, readline, lsblk, udisksctl, readline, and python
+basically just bash, readline, lsblk, udisksctl, and python
 
 ## installation
 
