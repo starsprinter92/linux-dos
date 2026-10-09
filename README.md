@@ -1,2 +1,21 @@
-just uhh copy dos to ur path and chmod +x it and run it
-this is like fully vibecoded pls do not use
+# DOS-Linux
+
+a DOS-inspired command-line shell for Linux. fully vibecoded. use at your own risk.
+
+## installation
+
+```bash
+git clone <your-repository-url>
+cd dos-linux
+cp dos ~/.local/bin/dos
+chmod +x ~/.local/bin/dos
+dos
+```
+
+make sure `~/.local/bin` is in your `PATH`.
+
+## disclaimer
+
+this project is experimental and mostly vibecoded. expect bugs, weird behavior, and questionable life choices.
+
+please do not use this for anything important. seriously.
